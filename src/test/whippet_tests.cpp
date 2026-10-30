@@ -92,6 +92,53 @@ BOOST_AUTO_TEST_CASE(subsidy_post_145k_test)
     }
 }
 
+/* Build a linked run of blocks ending at height nHeightLast, each one
+   nSolvetime seconds after its parent. nSolvetime may be negative. */
+static std::vector<CBlockIndex> LwmaChain(int nHeightLast, int nBlocks, int64_t nSolvetime, unsigned int nBits)
+{
+    std::vector<CBlockIndex> chain(nBlocks);
+    const int64_t nBaseTime = 1700000000;
+    for (int i = 0; i < nBlocks; i++) {
+        chain[i].nHeight = nHeightLast - (nBlocks - 1) + i;
+        chain[i].nTime = (unsigned int)(nBaseTime + nSolvetime * i);
+        chain[i].nBits = nBits;
+        chain[i].pprev = (i == 0) ? NULL : &chain[i - 1];
+    }
+    return chain;
+}
+
+/* Backwards timestamps must not collapse the LWMA target. The lower solvetime
+   clamp used to substitute T/6, leaving every solvetime in [-6T, 0) negative,
+   and sum_time reaches the target arithmetic as a uint32_t: a negative sum
+   became a ~4e9 multiplier, which here loosened the target by 13 million fold
+   (0x1b499dfd to 0x1e391be9), short of powLimit and so not clamped. */
+BOOST_AUTO_TEST_CASE(lwma_negative_solvetime)
+{
+    SelectParams(CBaseChainParams::MAIN);
+    const Consensus::Params& params = Params().GetConsensus(251);
+    BOOST_CHECK(params.fLWMADifficultyCalculation);
+
+    const unsigned int nBits = 0x1b499dfd;
+    const unsigned int nPowLimit = UintToArith256(params.powLimit).GetCompact();
+    const int64_t T = params.nPowTargetSpacing;
+
+    // Every solvetime at exactly -6T, which the old lower clamp let through.
+    std::vector<CBlockIndex> atClamp = LwmaChain(251, 12, -6 * T, nBits);
+    BOOST_CHECK_EQUAL(CalculateWhippetNextWorkRequired(&atClamp.back(), 0, params), nBits);
+
+    // And past it, where the old clamp substituted a positive T/6.
+    std::vector<CBlockIndex> pastClamp = LwmaChain(251, 12, -100 * T, nBits);
+    BOOST_CHECK_EQUAL(CalculateWhippetNextWorkRequired(&pastClamp.back(), 0, params), nBits);
+
+    // On-target solvetimes still retarget to about the same difficulty, so
+    // the guard above has not swallowed the ordinary path.
+    std::vector<CBlockIndex> onTarget = LwmaChain(251, 12, T, nBits);
+    const unsigned int nNext = CalculateWhippetNextWorkRequired(&onTarget.back(), 0, params);
+    BOOST_CHECK(nNext != nPowLimit);
+    BOOST_CHECK_CLOSE((double)arith_uint256().SetCompact(nNext).getdouble(),
+                      (double)arith_uint256().SetCompact(nBits).getdouble(), 1.0);
+}
+
 BOOST_AUTO_TEST_CASE(get_next_work_difficulty_limit)
 {
     SelectParams(CBaseChainParams::MAIN);
